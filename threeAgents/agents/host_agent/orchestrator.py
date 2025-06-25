@@ -63,7 +63,64 @@ class Orchestrator:
     def _list_agents(self) -> list[str]:
         return list(self.connectors.keys())
     
-    # i stoped here !
     async def _delegate_task(self, agent_name: str, message:str, tool_context: ToolContext) -> str:
-        pass
+        if agent_name not in self.connectors:
+            raise ValueError(f"Unknown agent: {agent_name}")
+        connector = self.connectors[agent_name]
 
+        state = tool_context.state
+        if "session_id" not in state:
+            state["session_id"] = str(uuid.uuid4())
+        session_id = state["session_id"]
+
+        child_task = await connector.send_task(message, session_id)
+
+        if child_task.history and len(child_task.history) > 1:
+            return child_task.history[-1].parts[0].text
+        return ""
+    
+    def invoke(self, query: str, session_id:str) -> str:
+        session = self._runner.session_service.get_session(
+            app_name=self._agent.name,
+            user_id=self._user_id,
+            session_id=session_id,
+            state={}
+        )
+        content = types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=query)]
+        )
+        events = list(
+            self._runner.run(
+                user_id=self._user_id,
+                session_id=session.id,
+                new_message=content
+            )
+        )
+        if not events or not events[-1].content or not events[-1].content.parts:
+            return ""
+        return "\n".join(p.text for p in events[-1].content.parts if p.text)
+
+class OrchestratorTaskManager(InMemoryTaskManager):
+
+    def __init__(self, agent: Orchestrator):
+        super().__init__()
+        self.agent = agent
+    
+    def _get_user_text(self, request: SendTaskRequest) -> str:
+        return request.params.message.parts[0].text
+    
+    async def on_send_task(self, request: SendTaskRequest) -> SendTaskResponse:
+        logger.info(f"OrchestratorTaskManager received task {request.params.id}")
+        task = await self.upsert_task(request.params)
+        user_text = self._get_user_text(request=request)
+        response_text = self.agent.invoke(user_text, request.params.sessionId)
+        reply = Message(role="agent", parts=[TexPart(text=response_text)])
+        async with self.lock:
+            task.status = TaskStatus(state=TaskState.COMPLETED)
+            task.history.append(reply)
+        
+        return SendTaskResponse(id=request.id, result=task)
+
+
+    
